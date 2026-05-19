@@ -23,6 +23,9 @@ create table if not exists pilgrims (
 -- Additive migrations (safe to re-run)
 alter table pilgrims add column if not exists checkin_at  date;
 alter table pilgrims add column if not exists checkout_at date;
+alter table pilgrims add column if not exists family      text  not null default '';
+alter table pilgrims add column if not exists log         jsonb not null default '[]'::jsonb;
+create index if not exists pilgrims_family_idx on pilgrims (family) where family <> '';
 create index if not exists pilgrims_name_idx  on pilgrims using gin (to_tsvector('simple', coalesce(name,'')));
 create index if not exists pilgrims_phone_idx on pilgrims (phone);
 
@@ -37,10 +40,12 @@ create table if not exists templates (
 
 -- ---- Single-row app config ------------------------------------
 create table if not exists app_config (
-  id            int primary key default 1 check (id = 1),
-  country_code  text not null default '92'
+  id              int  primary key default 1 check (id = 1),
+  country_code    text not null default '92',
+  bulk_delay_sec  int  not null default 5
 );
 insert into app_config (id) values (1) on conflict (id) do nothing;
+alter table app_config add column if not exists bulk_delay_sec int not null default 5;
 
 -- ---- updated_at trigger ---------------------------------------
 create or replace function touch_updated_at() returns trigger as $$
