@@ -3,31 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { normPhone, fillTemplate } from "@/lib/phone";
+import { parseBilooText, parseBilooSheets, type ParsedRow } from "@/lib/parse";
 import type { Pilgrim, Template } from "@/lib/types";
 
-type ParsedRow = { sel: boolean; name: string; phone: string; extra: string };
-
 const supabase = createClient();
-
-function parseLines(txt: string): ParsedRow[] {
-  const out: ParsedRow[] = [];
-  txt.split(/\r?\n/).forEach((line) => {
-    let s = line.trim();
-    if (!s) return;
-    s = s.replace(/^\s*\d{1,3}[.)\-]\s*/, "");
-    const m = s.match(/(\+?\d[\d\s\-()]{6,}\d)/);
-    if (!m || m.index == null) return;
-    const phone = m[1].trim();
-    let name = s.slice(0, m.index).replace(/[,|;\-–]+$/, "").trim();
-    let rest = s.slice(m.index + m[0].length).replace(/^[\s,|;\-–]+/, "").trim();
-    if (!name && rest) {
-      name = rest;
-      rest = "";
-    }
-    out.push({ sel: true, name: name || "(no name)", phone, extra: rest });
-  });
-  return out;
-}
 
 export default function HujjajApp() {
   const [loading, setLoading] = useState(true);
@@ -37,14 +16,19 @@ export default function HujjajApp() {
   const [q, setQ] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
-  const [sheet, setSheet] = useState<null | "add" | "set" | "wa">(null);
+  const [sheet, setSheet] = useState<null | "add" | "set" | "wa" | "bulk">(null);
   const [waTarget, setWaTarget] = useState<Pilgrim | null>(null);
   const [tab, setTab] = useState<"paste" | "file" | "one">("paste");
   const [bulk, setBulk] = useState("");
   const [parsed, setParsed] = useState<ParsedRow[]>([]);
+  const [parsedBus, setParsedBus] = useState("");
   const [fileStatus, setFileStatus] = useState("");
   const [one, setOne] = useState({ name: "", phone: "", bus: "", grp: "" });
   const [waCustom, setWaCustom] = useState("");
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkQueue, setBulkQueue] = useState<{ p: Pilgrim; msg: string }[]>([]);
+  const [bulkIdx, setBulkIdx] = useState(0);
   const toastT = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const flash = useCallback((m: string) => {
@@ -106,32 +90,33 @@ export default function HujjajApp() {
   }
 
   async function commitParsed() {
-    const selected = parsed.filter((r) => r.sel && r.phone.trim());
-    if (!selected.length) return flash("Nothing selected");
+    const picked = parsed.filter((r) => r.sel && r.phone.trim());
+    if (!picked.length) return flash("Nothing selected");
     const have = new Set(pilgrims.map((p) => normPhone(p.phone, cc)));
     const seen = new Set<string>();
     const rows: Omit<Pilgrim, "id">[] = [];
-    for (const r of selected) {
+    for (const r of picked) {
       const n = normPhone(r.phone, cc);
       if (!n || have.has(n) || seen.has(n)) continue;
       seen.add(n);
       rows.push({
         name: r.name.trim(),
         phone: r.phone.trim(),
-        notes: r.extra || "",
-        bus: "",
-        hotel: "",
+        bus: (r.bus || "").trim(),
+        hotel: (r.hotel || "").trim(),
         room: "",
-        grp: "",
+        grp: (r.grp || "").trim(),
+        notes: (r.notes || "").trim(),
       });
     }
     if (!rows.length) return flash("All already exist");
     const { error } = await supabase.from("pilgrims").insert(rows);
     if (error) return flash("Import failed");
     setParsed([]);
+    setParsedBus("");
     setBulk("");
     setSheet(null);
-    const dupes = selected.length - rows.length;
+    const dupes = picked.length - rows.length;
     flash(rows.length + " added" + (dupes ? ` · ${dupes} duplicates skipped` : ""));
   }
 
@@ -152,11 +137,38 @@ export default function HujjajApp() {
     flash("Added");
   }
 
+  function applyParsedText(text: string) {
+    const { rows, bus } = parseBilooText(text);
+    setParsed(rows);
+    setParsedBus(bus);
+  }
+
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
+    const ext = f.name.toLowerCase().split(".").pop() || "";
     try {
-      if (f.type === "application/pdf") {
+      if (ext === "xlsx" || ext === "xls" || f.type.includes("spreadsheet")) {
+        setFileStatus("Reading spreadsheet…");
+        const mod: any = await import("read-excel-file/browser");
+        const readXlsx = mod.default;
+        const readSheetNames = mod.readSheetNames;
+        const names: string[] = await readSheetNames(f);
+        const sheets: { name: string; rows: any[][] }[] = [];
+        for (const n of names) {
+          const rows = await readXlsx(f, { sheet: n });
+          sheets.push({ name: n, rows: rows as any[][] });
+        }
+        const { rows, bus } = parseBilooSheets(sheets);
+        if (!rows.length) {
+          setFileStatus("No rows found. Make sure the sheet has 'Passenger Name' and 'MOBIL NO' columns.");
+          return;
+        }
+        setParsed(rows);
+        setParsedBus(bus);
+        setTab("paste");
+        setFileStatus(`Extracted ${rows.length} rows from ${names.length} sheet(s)${bus ? ` · Bus ${bus}` : ""}.`);
+      } else if (f.type === "application/pdf" || ext === "pdf") {
         setFileStatus("Reading PDF…");
         const pdfjs: any = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
@@ -179,7 +191,7 @@ export default function HujjajApp() {
           return;
         }
         setBulk(txt.trim());
-        setParsed(parseLines(txt));
+        applyParsedText(txt);
         setTab("paste");
         setFileStatus("Extracted — review below.");
       } else if (f.type.startsWith("image/")) {
@@ -189,9 +201,11 @@ export default function HujjajApp() {
         const { data } = await Tesseract.recognize(f, "eng");
         const text = data.text || "";
         setBulk(text.trim());
-        setParsed(parseLines(text));
+        applyParsedText(text);
         setTab("paste");
         setFileStatus("OCR done — check it carefully, it is not perfect.");
+      } else {
+        setFileStatus("Unsupported file type. Upload Excel, PDF, or an image.");
       }
     } catch {
       setFileStatus("Could not read that file. Paste the text manually.");
@@ -299,7 +313,18 @@ export default function HujjajApp() {
             <h1>Hujjaj Connect</h1>
             <div className="sub">Billoo Travels · field ops</div>
           </div>
-          <button className="icbtn" style={{ marginLeft: "auto" }} onClick={() => setSheet("set")} title="Settings">
+          <button
+            className="icbtn"
+            style={{ marginLeft: "auto" }}
+            onClick={() => {
+              setSelectMode((v) => !v);
+              setSelected(new Set());
+            }}
+            title={selectMode ? "Exit select mode" : "Select multiple"}
+          >
+            {selectMode ? "✕" : "☑"}
+          </button>
+          <button className="icbtn" onClick={() => setSheet("set")} title="Settings">
             ⚙
           </button>
         </header>
@@ -350,17 +375,43 @@ export default function HujjajApp() {
                 .filter(Boolean)
                 .join(" · ") || p.phone || "no details";
             const open = openId === p.id;
+            const checked = selected.has(p.id);
             return (
               <div className={"row" + (open ? " open" : "")} key={p.id}>
-                <div className="rhead" onClick={() => setOpenId(open ? null : p.id)}>
-                  <div className="av">{ini}</div>
+                <div
+                  className="rhead"
+                  onClick={() => {
+                    if (selectMode) {
+                      setSelected((cur) => {
+                        const n = new Set(cur);
+                        if (n.has(p.id)) n.delete(p.id);
+                        else n.add(p.id);
+                        return n;
+                      });
+                    } else {
+                      setOpenId(open ? null : p.id);
+                    }
+                  }}
+                >
+                  {selectMode ? (
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      readOnly
+                      style={{ width: 22, height: 22, accentColor: "var(--green)", flex: "none" }}
+                    />
+                  ) : (
+                    <div className="av">{ini}</div>
+                  )}
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div className="rname">{p.name || "Unnamed"}</div>
                     <div className="rmeta">{meta}</div>
                   </div>
-                  <svg className="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    <path d="m9 6 6 6-6 6" />
-                  </svg>
+                  {!selectMode && (
+                    <svg className="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <path d="m9 6 6 6-6 6" />
+                    </svg>
+                  )}
                 </div>
                 {open && (
                   <div className="body">
@@ -437,9 +488,37 @@ export default function HujjajApp() {
         )}
       </div>
 
-      <button className="fab" onClick={() => { setParsed([]); setSheet("add"); }}>
-        ＋ Add hujjaj
-      </button>
+      {selectMode ? (
+        <div className="selbar">
+          <button
+            className="btn g sm"
+            onClick={() => {
+              const ids = new Set(list.map((p) => p.id));
+              const same = selected.size === ids.size && [...ids].every((i) => selected.has(i));
+              setSelected(same ? new Set() : ids);
+            }}
+          >
+            {selected.size === list.length && list.length > 0 ? "Clear" : "Select all"}
+          </button>
+          <div className="selcount">
+            <b>{selected.size}</b> selected
+          </div>
+          <button
+            className="btn p sm"
+            disabled={selected.size === 0}
+            onClick={() => {
+              if (selected.size === 0) return flash("Pick at least one");
+              setSheet("bulk");
+            }}
+          >
+            Send →
+          </button>
+        </div>
+      ) : (
+        <button className="fab" onClick={() => { setParsed([]); setParsedBus(""); setSheet("add"); }}>
+          ＋ Add hujjaj
+        </button>
+      )}
 
       {/* ADD SHEET */}
       {sheet === "add" && (
@@ -472,7 +551,7 @@ export default function HujjajApp() {
                     onChange={(e) => setBulk(e.target.value)}
                     placeholder={"Ahmed Ali  0300 1234567  Bus 3\nFatima Bibi, +92 321 1234567, Group A"}
                   />
-                  <button className="btn p sm" style={{ marginTop: 10 }} onClick={() => setParsed(parseLines(bulk))}>
+                  <button className="btn p sm" style={{ marginTop: 10 }} onClick={() => applyParsedText(bulk)}>
                     Parse list
                   </button>
                 </>
@@ -481,9 +560,14 @@ export default function HujjajApp() {
               {tab === "file" && (
                 <>
                   <div className="hint">
-                    <b>PDF with real text</b> extracts cleanly. A photo/scan uses on-device OCR (slower, review carefully).
+                    <b>Excel (.xlsx)</b> is the cleanest — columns map directly. <b>PDF</b> with real text is next best. <b>Photo / scan</b> uses on-device OCR (slower, review carefully).
                   </div>
-                  <input type="file" accept="application/pdf,image/*" onChange={onFile} style={{ fontSize: 13, width: "100%" }} />
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/pdf,image/*"
+                    onChange={onFile}
+                    style={{ fontSize: 13, width: "100%" }}
+                  />
                   {fileStatus && <div className="hint" style={{ marginTop: 10 }}>{fileStatus}</div>}
                 </>
               )}
@@ -529,7 +613,7 @@ export default function HujjajApp() {
                       Found {parsed.length} — review &amp; edit, then import
                     </div>
                     {parsed.map((r, i) => (
-                      <div className="pitem" key={i}>
+                      <div className="pitem" key={i} style={{ flexWrap: "wrap" }}>
                         <input
                           type="checkbox"
                           checked={r.sel}
@@ -540,6 +624,7 @@ export default function HujjajApp() {
                         <input
                           type="text"
                           className="nm"
+                          placeholder="Name"
                           value={r.name}
                           onChange={(e) =>
                             setParsed(parsed.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))
@@ -547,6 +632,7 @@ export default function HujjajApp() {
                         />
                         <input
                           type="text"
+                          placeholder="Phone"
                           value={r.phone}
                           inputMode="tel"
                           style={{ maxWidth: 140 }}
@@ -554,12 +640,211 @@ export default function HujjajApp() {
                             setParsed(parsed.map((x, j) => (j === i ? { ...x, phone: e.target.value } : x)))
                           }
                         />
+                        <input
+                          type="text"
+                          placeholder="Hotel"
+                          value={r.hotel}
+                          style={{ flex: "1 1 100%", marginLeft: 28 }}
+                          onChange={(e) =>
+                            setParsed(parsed.map((x, j) => (j === i ? { ...x, hotel: e.target.value } : x)))
+                          }
+                        />
+                        <input
+                          type="text"
+                          placeholder="Group (PKG)"
+                          value={r.grp}
+                          style={{ flex: 1, marginLeft: 28 }}
+                          onChange={(e) =>
+                            setParsed(parsed.map((x, j) => (j === i ? { ...x, grp: e.target.value } : x)))
+                          }
+                        />
+                        <input
+                          type="text"
+                          placeholder="Bus"
+                          value={r.bus}
+                          style={{ maxWidth: 80 }}
+                          onChange={(e) =>
+                            setParsed(parsed.map((x, j) => (j === i ? { ...x, bus: e.target.value } : x)))
+                          }
+                        />
                       </div>
                     ))}
+                  </div>
+                  <div className="fld" style={{ marginTop: 12 }}>
+                    <label>Apply bus number to all (optional)</label>
+                    <input
+                      type="text"
+                      value={parsedBus}
+                      placeholder="e.g. 01"
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setParsedBus(v);
+                        setParsed(parsed.map((r) => ({ ...r, bus: v })));
+                      }}
+                      style={{ maxWidth: 140 }}
+                    />
                   </div>
                   <button className="btn p" style={{ width: "100%", marginTop: 14 }} onClick={commitParsed}>
                     Import selected
                   </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK SEND SHEET */}
+      {sheet === "bulk" && (
+        <div className="ov" onClick={(e) => e.target === e.currentTarget && (bulkQueue.length === 0 && setSheet(null))}>
+          <div className="sheet">
+            <div className="shead">
+              <h2>
+                {bulkQueue.length === 0
+                  ? `Send to ${selected.size}`
+                  : `Sending ${Math.min(bulkIdx + 1, bulkQueue.length)} / ${bulkQueue.length}`}
+              </h2>
+              <button
+                className="x"
+                onClick={() => {
+                  setSheet(null);
+                  setBulkQueue([]);
+                  setBulkIdx(0);
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="sbody">
+              {bulkQueue.length === 0 ? (
+                <>
+                  <div className="hint" style={{ marginTop: 0 }}>
+                    WhatsApp opens one chat at a time. Pick a template — each chat opens pre-filled, you tap Send, then come back here for the next person.
+                  </div>
+                  {templates.map((t) => (
+                    <div
+                      className="tplpick"
+                      key={t.id}
+                      onClick={() => {
+                        const targets = pilgrims.filter((p) => selected.has(p.id));
+                        const queue = targets
+                          .map((p) => ({
+                            p,
+                            msg: fillTemplate(t.body, {
+                              name: p.name,
+                              hotel: p.hotel,
+                              room: p.room,
+                              bus: p.bus,
+                              group: p.grp,
+                              notes: p.notes,
+                            }),
+                          }))
+                          .filter((x) => normPhone(x.p.phone, cc));
+                        if (!queue.length) return flash("No valid numbers in selection");
+                        setBulkQueue(queue);
+                        setBulkIdx(0);
+                      }}
+                    >
+                      <div className="tt">{t.title}</div>
+                      <div className="tx">{t.body.slice(0, 160)}</div>
+                    </div>
+                  ))}
+                  <div className="fld" style={{ marginTop: 8 }}>
+                    <label>Or write a custom message (same for everyone — placeholders fill per person)</label>
+                    <textarea
+                      style={{ minHeight: 90 }}
+                      value={waCustom}
+                      onChange={(e) => setWaCustom(e.target.value)}
+                      placeholder="Assalam o Alaikum {name}, ..."
+                    />
+                  </div>
+                  <button
+                    className="btn wa"
+                    style={{ marginTop: 10 }}
+                    onClick={() => {
+                      if (!waCustom.trim()) return flash("Write a message first");
+                      const targets = pilgrims.filter((p) => selected.has(p.id));
+                      const queue = targets
+                        .map((p) => ({
+                          p,
+                          msg: fillTemplate(waCustom.trim(), {
+                            name: p.name,
+                            hotel: p.hotel,
+                            room: p.room,
+                            bus: p.bus,
+                            group: p.grp,
+                            notes: p.notes,
+                          }),
+                        }))
+                        .filter((x) => normPhone(x.p.phone, cc));
+                      if (!queue.length) return flash("No valid numbers in selection");
+                      setBulkQueue(queue);
+                      setBulkIdx(0);
+                    }}
+                  >
+                    Start with custom message →
+                  </button>
+                </>
+              ) : bulkIdx >= bulkQueue.length ? (
+                <>
+                  <div className="note" style={{ background: "#e8f5ee", borderColor: "#b9dec7", color: "#164e36" }}>
+                    All {bulkQueue.length} chats opened. Done.
+                  </div>
+                  <button
+                    className="btn p"
+                    style={{ width: "100%" }}
+                    onClick={() => {
+                      setSheet(null);
+                      setBulkQueue([]);
+                      setBulkIdx(0);
+                      setSelected(new Set());
+                      setSelectMode(false);
+                    }}
+                  >
+                    Close
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="tpl">
+                    <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>
+                      {bulkQueue[bulkIdx].p.name || "Unnamed"}
+                    </div>
+                    <div className="sub" style={{ marginBottom: 8 }}>
+                      +{normPhone(bulkQueue[bulkIdx].p.phone, cc)}
+                    </div>
+                    <textarea
+                      value={bulkQueue[bulkIdx].msg}
+                      readOnly
+                      style={{ minHeight: 110, background: "var(--paper)" }}
+                    />
+                  </div>
+                  <button
+                    className="btn wa"
+                    onClick={() => {
+                      const cur = bulkQueue[bulkIdx];
+                      const n = normPhone(cur.p.phone, cc);
+                      window.open("https://wa.me/" + n + "?text=" + encodeURIComponent(cur.msg), "_blank");
+                      setBulkIdx((i) => i + 1);
+                    }}
+                  >
+                    Open WhatsApp → Next
+                  </button>
+                  <div className="acts" style={{ marginTop: 8 }}>
+                    <button className="btn g sm" onClick={() => setBulkIdx((i) => i + 1)}>
+                      Skip
+                    </button>
+                    <button
+                      className="btn g sm"
+                      onClick={() => {
+                        setBulkQueue([]);
+                        setBulkIdx(0);
+                        setSheet(null);
+                      }}
+                    >
+                      Stop
+                    </button>
+                  </div>
                 </>
               )}
             </div>
