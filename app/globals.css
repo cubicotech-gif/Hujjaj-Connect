@@ -95,6 +95,10 @@ textarea:focus{border-color:var(--green)}
 .toast.show{transform:translateX(-50%);opacity:1}
 .fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:max(20px,env(safe-area-inset-bottom));background:var(--green);color:#fff;border:0;border-radius:16px;padding:15px 20px;font-weight:700;box-shadow:0 10px 26px -8px rgba(31,107,74,.55);cursor:pointer;display:flex;gap:8px;align-items:center;z-index:20}
 .fab:active{transform:scale(.96)}
+.selbar{position:fixed;left:max(16px,env(safe-area-inset-left));right:max(16px,env(safe-area-inset-right));bottom:max(16px,env(safe-area-inset-bottom));max-width:680px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:10px 12px;display:flex;gap:10px;align-items:center;box-shadow:0 10px 26px -8px rgba(36,31,23,.25);z-index:20}
+.selcount{flex:1;text-align:center;color:var(--muted);font-size:13px;font-weight:600}
+.selcount b{color:var(--ink);font-variant-numeric:tabular-nums}
+.btn:disabled{opacity:.4;cursor:not-allowed}
 .loading{text-align:center;padding:60px 20px;color:var(--muted)}
 .spin{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--green);border-radius:50%;animation:sp 1s linear infinite;margin:0 auto 14px}
 @keyframes sp{to{transform:rotate(360deg)}}
