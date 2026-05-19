@@ -1,3 +1,5 @@
+export type LogEntry = { at: string; note: string };
+
 export type Pilgrim = {
   id: string;
   name: string;
@@ -7,6 +9,10 @@ export type Pilgrim = {
   room: string;
   grp: string;
   notes: string;
+  family?: string;
+  log?: LogEntry[];
+  checkin_at?: string | null;
+  checkout_at?: string | null;
   created_at?: string;
   updated_at?: string;
 };

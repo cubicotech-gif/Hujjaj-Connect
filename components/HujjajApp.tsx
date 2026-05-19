@@ -4,9 +4,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { normPhone, fillTemplate } from "@/lib/phone";
 import { parseBilooText, parseBilooSheets, type ParsedRow } from "@/lib/parse";
-import type { Pilgrim, Template } from "@/lib/types";
+import type { Pilgrim, Template, LogEntry } from "@/lib/types";
 
 const supabase = createClient();
+
+type Status = "wait" | "in" | "out";
+const STATUS_LABEL: Record<Status, string> = {
+  wait: "Not arrived",
+  in: "Checked in",
+  out: "Departed",
+};
+function statusOf(p: Pilgrim): Status {
+  if (p.checkout_at) return "out";
+  if (p.checkin_at) return "in";
+  return "wait";
+}
 
 export default function HujjajApp() {
   const [loading, setLoading] = useState(true);
@@ -16,7 +28,15 @@ export default function HujjajApp() {
   const [q, setQ] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
-  const [sheet, setSheet] = useState<null | "add" | "set" | "wa" | "bulk">(null);
+  const [sheet, setSheet] = useState<null | "add" | "set" | "wa" | "bulk" | "bulkedit" | "filter">(null);
+  const [filterCat, setFilterCat] = useState<"bus" | "hotel" | "grp" | "status">("bus");
+  const [fBus, setFBus] = useState<Set<string>>(new Set());
+  const [fHotel, setFHotel] = useState<Set<string>>(new Set());
+  const [fGrp, setFGrp] = useState<Set<string>>(new Set());
+  const [fStatus, setFStatus] = useState<Set<Status>>(new Set());
+  const [bulkDelaySec, setBulkDelaySec] = useState(5);
+  const [waitUntil, setWaitUntil] = useState<number | null>(null);
+  const [tick, setTick] = useState(0);
   const [waTarget, setWaTarget] = useState<Pilgrim | null>(null);
   const [tab, setTab] = useState<"paste" | "file" | "one">("paste");
   const [bulk, setBulk] = useState("");
@@ -29,6 +49,15 @@ export default function HujjajApp() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkQueue, setBulkQueue] = useState<{ p: Pilgrim; msg: string }[]>([]);
   const [bulkIdx, setBulkIdx] = useState(0);
+  const [bulkEdit, setBulkEdit] = useState({
+    hotel: "",
+    room: "",
+    bus: "",
+    grp: "",
+    family: "",
+    checkin_at: "",
+    checkout_at: "",
+  });
   const toastT = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const flash = useCallback((m: string) => {
@@ -41,11 +70,12 @@ export default function HujjajApp() {
     const [p, t, c] = await Promise.all([
       supabase.from("pilgrims").select("*").order("created_at", { ascending: true }),
       supabase.from("templates").select("*").order("sort", { ascending: true }),
-      supabase.from("app_config").select("country_code").eq("id", 1).single(),
+      supabase.from("app_config").select("country_code,bulk_delay_sec").eq("id", 1).single(),
     ]);
     if (p.data) setPilgrims(p.data as Pilgrim[]);
     if (t.data) setTemplates(t.data as Template[]);
     if (c.data?.country_code) setCc(c.data.country_code);
+    if (c.data && typeof c.data.bulk_delay_sec === "number") setBulkDelaySec(c.data.bulk_delay_sec);
     setLoading(false);
   }, []);
 
@@ -70,23 +100,141 @@ export default function HujjajApp() {
 
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
-    if (!s) return pilgrims;
-    return pilgrims.filter((p) =>
-      [p.name, p.phone, p.bus, p.hotel, p.room, p.grp, p.notes].some((v) =>
-        (v || "").toLowerCase().includes(s)
-      )
-    );
-  }, [pilgrims, q]);
+    return pilgrims.filter((p) => {
+      if (fBus.size && !fBus.has(p.bus || "")) return false;
+      if (fHotel.size && !fHotel.has(p.hotel || "")) return false;
+      if (fGrp.size && !fGrp.has(p.grp || "")) return false;
+      if (fStatus.size && !fStatus.has(statusOf(p))) return false;
+      if (!s) return true;
+      return [p.name, p.phone, p.bus, p.hotel, p.room, p.grp, p.notes, p.family]
+        .some((v) => (v || "").toLowerCase().includes(s));
+    });
+  }, [pilgrims, q, fBus, fHotel, fGrp, fStatus]);
+
+  // Tick for the bulk-send countdown timer
+  useEffect(() => {
+    if (waitUntil == null) return;
+    const id = setInterval(() => setTick((n) => n + 1), 250);
+    return () => clearInterval(id);
+  }, [waitUntil]);
+  useEffect(() => {
+    if (waitUntil != null && Date.now() >= waitUntil) {
+      setWaitUntil(null);
+      setBulkIdx((i) => i + 1);
+    }
+  }, [tick, waitUntil]);
+
+  const isDateField = (f: keyof Pilgrim) => f === "checkin_at" || f === "checkout_at";
 
   async function patch(id: string, field: keyof Pilgrim, value: string) {
-    setPilgrims((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
-    await supabase.from("pilgrims").update({ [field]: value }).eq("id", id);
+    const dbValue = isDateField(field) ? (value || null) : value;
+    setPilgrims((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: dbValue } : p)));
+    await supabase.from("pilgrims").update({ [field]: dbValue }).eq("id", id);
   }
   async function del(p: Pilgrim) {
     if (!confirm("Delete " + (p.name || "this person") + "?")) return;
     await supabase.from("pilgrims").delete().eq("id", p.id);
     setPilgrims((cur) => cur.filter((x) => x.id !== p.id));
     flash("Deleted");
+  }
+
+  async function bulkDelete() {
+    const ids = [...selected];
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} hujji? This cannot be undone.`)) return;
+    setPilgrims((cur) => cur.filter((p) => !selected.has(p.id)));
+    const { error } = await supabase.from("pilgrims").delete().in("id", ids);
+    if (error) return flash("Delete failed");
+    setSelected(new Set());
+    setSelectMode(false);
+    flash(`Deleted ${ids.length}`);
+  }
+
+  async function applyBulkEdit() {
+    const ids = [...selected];
+    if (!ids.length) return flash("Pick people first");
+    const updates: Record<string, string | null> = {};
+    (Object.keys(bulkEdit) as (keyof typeof bulkEdit)[]).forEach((k) => {
+      const v = bulkEdit[k].trim();
+      if (!v) return;
+      if (k === "checkin_at" || k === "checkout_at") updates[k] = v;
+      else updates[k] = v;
+    });
+    if (!Object.keys(updates).length) return flash("Fill at least one field");
+    setPilgrims((cur) => cur.map((p) => (selected.has(p.id) ? { ...p, ...updates } : p)));
+    const { error } = await supabase.from("pilgrims").update(updates).in("id", ids);
+    if (error) return flash("Update failed");
+    setBulkEdit({ hotel: "", room: "", bus: "", grp: "", family: "", checkin_at: "", checkout_at: "" });
+    setSheet(null);
+    setSelected(new Set());
+    setSelectMode(false);
+    flash(`Updated ${ids.length}`);
+  }
+
+  function fmtDate(s?: string | null): string {
+    if (!s) return "";
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  }
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  function fmtLogTime(s: string): string {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return (
+      d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }) +
+      " " +
+      d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })
+    );
+  }
+
+  async function addLog(p: Pilgrim, note: string) {
+    const trimmed = note.trim();
+    if (!trimmed) return;
+    const entry: LogEntry = { at: new Date().toISOString(), note: trimmed };
+    const newLog: LogEntry[] = [...(p.log || []), entry];
+    setPilgrims((cur) => cur.map((x) => (x.id === p.id ? { ...x, log: newLog } : x)));
+    await supabase.from("pilgrims").update({ log: newLog }).eq("id", p.id);
+  }
+
+  async function delLog(p: Pilgrim, idx: number) {
+    const newLog = (p.log || []).filter((_, i) => i !== idx);
+    setPilgrims((cur) => cur.map((x) => (x.id === p.id ? { ...x, log: newLog } : x)));
+    await supabase.from("pilgrims").update({ log: newLog }).eq("id", p.id);
+  }
+
+  async function saveBulkDelay(n: number) {
+    const clamped = Math.max(0, Math.min(60, n | 0));
+    setBulkDelaySec(clamped);
+    await supabase.from("app_config").update({ bulk_delay_sec: clamped }).eq("id", 1);
+  }
+
+  // Filter helpers
+  const uniqStrings = (key: "bus" | "hotel" | "grp"): string[] => {
+    const s = new Set<string>();
+    for (const p of pilgrims) {
+      const v = (p[key] || "").trim();
+      if (v) s.add(v);
+    }
+    return Array.from(s).sort();
+  };
+  const countBy = (key: "bus" | "hotel" | "grp", v: string) =>
+    pilgrims.filter((p) => (p[key] || "") === v).length;
+  const statusCount = (s: Status) => pilgrims.filter((p) => statusOf(p) === s).length;
+
+  const activeFilterCount = fBus.size + fHotel.size + fGrp.size + fStatus.size;
+  function clearAllFilters() {
+    setFBus(new Set());
+    setFHotel(new Set());
+    setFGrp(new Set());
+    setFStatus(new Set());
+  }
+  function toggleSet<T>(set: Set<T>, setter: (s: Set<T>) => void, v: T) {
+    const n = new Set(set);
+    if (n.has(v)) n.delete(v);
+    else n.add(v);
+    setter(n);
   }
 
   async function commitParsed() {
@@ -258,9 +406,9 @@ export default function HujjajApp() {
     flash("Backup downloaded");
   }
   function expCsv() {
-    const head = ["name", "phone", "intl", "bus", "hotel", "room", "group", "notes"];
+    const head = ["name", "phone", "intl", "bus", "hotel", "room", "group", "family", "notes", "checkin", "checkout"];
     const rows = pilgrims.map((p) =>
-      [p.name, p.phone, "+" + normPhone(p.phone, cc), p.bus, p.hotel, p.room, p.grp, p.notes]
+      [p.name, p.phone, "+" + normPhone(p.phone, cc), p.bus, p.hotel, p.room, p.grp, p.family || "", p.notes, p.checkin_at || "", p.checkout_at || ""]
         .map((v) => '"' + String(v || "").replace(/"/g, '""') + '"')
         .join(",")
     );
@@ -283,7 +431,11 @@ export default function HujjajApp() {
             hotel: p.hotel || "",
             room: p.room || "",
             grp: p.grp || "",
+            family: p.family || "",
             notes: p.notes || "",
+            log: Array.isArray(p.log) ? p.log : [],
+            checkin_at: p.checkin_at || null,
+            checkout_at: p.checkout_at || null,
           }));
         if (rows.length) await supabase.from("pilgrims").insert(rows);
         flash(rows.length + " new hujjaj imported");
@@ -342,13 +494,42 @@ export default function HujjajApp() {
             />
           </div>
         </div>
+        <div className="filtrow">
+          {([
+            ["bus", "Bus", fBus.size],
+            ["hotel", "Hotel", fHotel.size],
+            ["grp", "Group", fGrp.size],
+            ["status", "Status", fStatus.size],
+          ] as const).map(([cat, label, n]) => (
+            <button
+              key={cat}
+              className={"chipbtn" + (n ? " on" : "")}
+              onClick={() => {
+                setFilterCat(cat);
+                setSheet("filter");
+              }}
+            >
+              {label} {n ? `· ${n}` : "▾"}
+            </button>
+          ))}
+          {activeFilterCount > 0 && (
+            <button className="chipbtn clear" onClick={clearAllFilters}>
+              Clear ✕
+            </button>
+          )}
+        </div>
         <div className="stat">
           <span>
             <b>{pilgrims.length}</b> hujjaj
           </span>
-          {q && (
+          {(q || activeFilterCount > 0) && (
             <span>
               <b>{list.length}</b> shown
+            </span>
+          )}
+          {statusCount("in") > 0 && (
+            <span>
+              <b>{statusCount("in")}</b> checked in
             </span>
           )}
         </div>
@@ -371,7 +552,14 @@ export default function HujjajApp() {
             const intl = normPhone(p.phone, cc);
             const ini = (p.name || "?").trim().charAt(0).toUpperCase() || "?";
             const meta =
-              [p.bus && "Bus " + p.bus, p.hotel, p.room && "Rm " + p.room, p.grp]
+              [
+                p.bus && "Bus " + p.bus,
+                p.hotel,
+                p.room && "Rm " + p.room,
+                p.grp,
+                p.checkin_at && "✓ In " + fmtDate(p.checkin_at),
+                p.checkout_at && "Out " + fmtDate(p.checkout_at),
+              ]
                 .filter(Boolean)
                 .join(" · ") || p.phone || "no details";
             const open = openId === p.id;
@@ -447,6 +635,74 @@ export default function HujjajApp() {
                           onBlur={(e) => e.target.value !== p.notes && patch(p.id, "notes", e.target.value)}
                         />
                       </div>
+                      <div className="fld col2">
+                        <label>Family / Mehram</label>
+                        <input
+                          defaultValue={p.family || ""}
+                          placeholder="Shared label, e.g. GOHAR FAMILY"
+                          onBlur={(e) =>
+                            e.target.value !== (p.family || "") && patch(p.id, "family", e.target.value)
+                          }
+                        />
+                        {p.family &&
+                          (() => {
+                            const fam = pilgrims.filter((x) => x.family === p.family && x.id !== p.id);
+                            if (!fam.length)
+                              return <div className="fammeta">No other members yet.</div>;
+                            return (
+                              <div className="famlist">
+                                {fam.map((f) => (
+                                  <button
+                                    key={f.id}
+                                    className="famchip"
+                                    onClick={() => setOpenId(f.id)}
+                                  >
+                                    {f.name || "Unnamed"}
+                                    {f.room ? ` · Rm ${f.room}` : ""}
+                                  </button>
+                                ))}
+                              </div>
+                            );
+                          })()}
+                      </div>
+                      <div className="fld">
+                        <label>Check-in</label>
+                        <input
+                          type="date"
+                          key={"in-" + p.id + "-" + (p.checkin_at || "")}
+                          defaultValue={p.checkin_at || ""}
+                          onBlur={(e) =>
+                            (e.target.value || null) !== (p.checkin_at || null) &&
+                            patch(p.id, "checkin_at", e.target.value)
+                          }
+                        />
+                        <button
+                          className="btn g sm"
+                          style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                          onClick={() => patch(p.id, "checkin_at", today())}
+                        >
+                          Check in today
+                        </button>
+                      </div>
+                      <div className="fld">
+                        <label>Check-out</label>
+                        <input
+                          type="date"
+                          key={"out-" + p.id + "-" + (p.checkout_at || "")}
+                          defaultValue={p.checkout_at || ""}
+                          onBlur={(e) =>
+                            (e.target.value || null) !== (p.checkout_at || null) &&
+                            patch(p.id, "checkout_at", e.target.value)
+                          }
+                        />
+                        <button
+                          className="btn g sm"
+                          style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                          onClick={() => patch(p.id, "checkout_at", today())}
+                        >
+                          Check out today
+                        </button>
+                      </div>
                     </div>
                     <button
                       className="btn wa"
@@ -477,6 +733,49 @@ export default function HujjajApp() {
                         Open chat
                       </button>
                     </div>
+                    <div className="logbox">
+                      <div className="loghead">Activity log</div>
+                      <input
+                        className="loginput"
+                        placeholder="Add note + Enter (e.g. delivered passport)"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const v = (e.currentTarget as HTMLInputElement).value;
+                            if (v.trim()) {
+                              addLog(p, v);
+                              (e.currentTarget as HTMLInputElement).value = "";
+                            }
+                          }
+                        }}
+                      />
+                      {(p.log || []).length === 0 ? (
+                        <div className="logempty">No entries yet.</div>
+                      ) : (
+                        (p.log || [])
+                          .slice()
+                          .reverse()
+                          .slice(0, 8)
+                          .map((entry, i) => {
+                            const realIdx = (p.log || []).length - 1 - i;
+                            return (
+                              <div className="logentry" key={realIdx}>
+                                <span className="logtime">{fmtLogTime(entry.at)}</span>
+                                <span className="lognote">{entry.note}</span>
+                                <button
+                                  className="logdel"
+                                  onClick={() => delLog(p, realIdx)}
+                                  title="Delete entry"
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            );
+                          })
+                      )}
+                      {(p.log || []).length > 8 && (
+                        <div className="logmore">+ {(p.log || []).length - 8} earlier</div>
+                      )}
+                    </div>
                     <button className="danger" onClick={() => del(p)}>
                       Delete this hujji
                     </button>
@@ -498,10 +797,10 @@ export default function HujjajApp() {
               setSelected(same ? new Set() : ids);
             }}
           >
-            {selected.size === list.length && list.length > 0 ? "Clear" : "Select all"}
+            {selected.size === list.length && list.length > 0 ? "Clear" : "All"}
           </button>
           <div className="selcount">
-            <b>{selected.size}</b> selected
+            <b>{selected.size}</b>
           </div>
           <button
             className="btn p sm"
@@ -511,7 +810,26 @@ export default function HujjajApp() {
               setSheet("bulk");
             }}
           >
-            Send →
+            Send
+          </button>
+          <button
+            className="btn g sm"
+            disabled={selected.size === 0}
+            onClick={() => {
+              if (selected.size === 0) return flash("Pick at least one");
+              setBulkEdit({ hotel: "", room: "", bus: "", grp: "", family: "", checkin_at: "", checkout_at: "" });
+              setSheet("bulkedit");
+            }}
+          >
+            Edit
+          </button>
+          <button
+            className="btn sm"
+            style={{ background: "#fdecec", color: "var(--warn)", border: "1px solid #f3cfcf" }}
+            disabled={selected.size === 0}
+            onClick={bulkDelete}
+          >
+            Delete
           </button>
         </div>
       ) : (
@@ -819,19 +1137,46 @@ export default function HujjajApp() {
                       style={{ minHeight: 110, background: "var(--paper)" }}
                     />
                   </div>
-                  <button
-                    className="btn wa"
-                    onClick={() => {
-                      const cur = bulkQueue[bulkIdx];
-                      const n = normPhone(cur.p.phone, cc);
-                      window.open("https://wa.me/" + n + "?text=" + encodeURIComponent(cur.msg), "_blank");
-                      setBulkIdx((i) => i + 1);
-                    }}
-                  >
-                    Open WhatsApp → Next
-                  </button>
+                  {waitUntil != null ? (
+                    <div className="countdown">
+                      <div className="cdmain">
+                        Next person in <b>{Math.max(0, Math.ceil((waitUntil - Date.now()) / 1000))}s</b>
+                      </div>
+                      <button
+                        className="btn g sm"
+                        onClick={() => {
+                          setWaitUntil(null);
+                          setBulkIdx((i) => i + 1);
+                        }}
+                      >
+                        Skip wait
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      className="btn wa"
+                      onClick={() => {
+                        const cur = bulkQueue[bulkIdx];
+                        const n = normPhone(cur.p.phone, cc);
+                        window.open("https://wa.me/" + n + "?text=" + encodeURIComponent(cur.msg), "_blank");
+                        if (bulkDelaySec > 0) {
+                          setWaitUntil(Date.now() + bulkDelaySec * 1000);
+                        } else {
+                          setBulkIdx((i) => i + 1);
+                        }
+                      }}
+                    >
+                      Open WhatsApp → Next
+                    </button>
+                  )}
                   <div className="acts" style={{ marginTop: 8 }}>
-                    <button className="btn g sm" onClick={() => setBulkIdx((i) => i + 1)}>
+                    <button
+                      className="btn g sm"
+                      onClick={() => {
+                        setWaitUntil(null);
+                        setBulkIdx((i) => i + 1);
+                      }}
+                    >
                       Skip
                     </button>
                     <button
@@ -839,6 +1184,7 @@ export default function HujjajApp() {
                       onClick={() => {
                         setBulkQueue([]);
                         setBulkIdx(0);
+                        setWaitUntil(null);
                         setSheet(null);
                       }}
                     >
@@ -847,6 +1193,171 @@ export default function HujjajApp() {
                   </div>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FILTER SHEET */}
+      {sheet === "filter" && (
+        <div className="ov" onClick={(e) => e.target === e.currentTarget && setSheet(null)}>
+          <div className="sheet">
+            <div className="shead">
+              <h2>
+                Filter by{" "}
+                {filterCat === "grp" ? "group" : filterCat}
+              </h2>
+              <button className="x" onClick={() => setSheet(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="sbody">
+              {filterCat === "status" ? (
+                <>
+                  {(["wait", "in", "out"] as const).map((s) => (
+                    <label key={s} className="filtopt">
+                      <input
+                        type="checkbox"
+                        checked={fStatus.has(s)}
+                        onChange={() => toggleSet(fStatus, setFStatus, s)}
+                      />
+                      <span className="filtlabel">{STATUS_LABEL[s]}</span>
+                      <span className="filtcount">{statusCount(s)}</span>
+                    </label>
+                  ))}
+                </>
+              ) : (
+                <>
+                  {uniqStrings(filterCat).length === 0 ? (
+                    <div className="hint">No values yet.</div>
+                  ) : (
+                    uniqStrings(filterCat).map((v) => {
+                      const set =
+                        filterCat === "bus" ? fBus : filterCat === "hotel" ? fHotel : fGrp;
+                      const setter =
+                        filterCat === "bus" ? setFBus : filterCat === "hotel" ? setFHotel : setFGrp;
+                      return (
+                        <label key={v} className="filtopt">
+                          <input
+                            type="checkbox"
+                            checked={set.has(v)}
+                            onChange={() => toggleSet(set, setter, v)}
+                          />
+                          <span className="filtlabel">{v}</span>
+                          <span className="filtcount">{countBy(filterCat, v)}</span>
+                        </label>
+                      );
+                    })
+                  )}
+                </>
+              )}
+              <div className="acts" style={{ marginTop: 14 }}>
+                <button
+                  className="btn g sm"
+                  onClick={() => {
+                    if (filterCat === "bus") setFBus(new Set());
+                    else if (filterCat === "hotel") setFHotel(new Set());
+                    else if (filterCat === "grp") setFGrp(new Set());
+                    else setFStatus(new Set());
+                  }}
+                >
+                  Clear
+                </button>
+                <button className="btn p sm" onClick={() => setSheet(null)}>
+                  Done
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK EDIT SHEET */}
+      {sheet === "bulkedit" && (
+        <div className="ov" onClick={(e) => e.target === e.currentTarget && setSheet(null)}>
+          <div className="sheet">
+            <div className="shead">
+              <h2>Edit {selected.size}</h2>
+              <button className="x" onClick={() => setSheet(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="sbody">
+              <div className="hint" style={{ marginTop: 0 }}>
+                Fill any field to apply to all selected. <b>Blank fields are left alone.</b>
+              </div>
+              <div className="grid">
+                <div className="fld">
+                  <label>Hotel</label>
+                  <input
+                    value={bulkEdit.hotel}
+                    placeholder="e.g. Swissotel Makkah"
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, hotel: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Room</label>
+                  <input
+                    value={bulkEdit.room}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, room: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Bus</label>
+                  <input
+                    value={bulkEdit.bus}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, bus: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Group</label>
+                  <input
+                    value={bulkEdit.grp}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, grp: e.target.value })}
+                  />
+                </div>
+                <div className="fld col2">
+                  <label>Family / Mehram</label>
+                  <input
+                    value={bulkEdit.family}
+                    placeholder="Shared label, e.g. GOHAR FAMILY"
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, family: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Check-in</label>
+                  <input
+                    type="date"
+                    value={bulkEdit.checkin_at}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, checkin_at: e.target.value })}
+                  />
+                  <button
+                    className="btn g sm"
+                    style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                    onClick={() => setBulkEdit({ ...bulkEdit, checkin_at: today() })}
+                  >
+                    Today
+                  </button>
+                </div>
+                <div className="fld">
+                  <label>Check-out</label>
+                  <input
+                    type="date"
+                    value={bulkEdit.checkout_at}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, checkout_at: e.target.value })}
+                  />
+                  <button
+                    className="btn g sm"
+                    style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                    onClick={() => setBulkEdit({ ...bulkEdit, checkout_at: today() })}
+                  >
+                    Today
+                  </button>
+                </div>
+              </div>
+              <button className="btn p" style={{ width: "100%", marginTop: 14 }} onClick={applyBulkEdit}>
+                Apply to {selected.size}
+              </button>
             </div>
           </div>
         </div>
@@ -940,6 +1451,21 @@ export default function HujjajApp() {
               </div>
               <div className="hint">
                 Local numbers like <code>0300…</code> become <code>+&lt;code&gt; 300…</code>. Pakistan = 92, Saudi = 966.
+              </div>
+
+              <div className="fld" style={{ marginTop: 14 }}>
+                <label>Bulk WhatsApp delay (seconds between sends)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={60}
+                  defaultValue={bulkDelaySec}
+                  style={{ maxWidth: 140 }}
+                  onBlur={(e) => saveBulkDelay(parseInt(e.target.value, 10) || 0)}
+                />
+              </div>
+              <div className="hint">
+                Adds a pause between &quot;Next&quot; opens when sending to many people, so the pattern looks human. <b>0 = no delay</b>.
               </div>
 
               <h2 style={{ fontFamily: "Fraunces", fontSize: 16, margin: "18px 0 4px" }}>Message templates</h2>
