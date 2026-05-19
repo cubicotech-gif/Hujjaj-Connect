@@ -70,6 +70,7 @@ create policy "open cfg"       on app_config for all to anon, authenticated usin
 -- ---- Realtime --------------------------------------------------
 alter publication supabase_realtime add table pilgrims;
 alter publication supabase_realtime add table templates;
+alter publication supabase_realtime add table app_config;
 
 -- ---- Seed default templates -----------------------------------
 insert into templates (title, body, sort)

@@ -63,7 +63,7 @@ h1{font-family:"Fraunces",serif;font-weight:600;font-size:21px;letter-spacing:-.
 .acts .btn{flex:1}
 .danger{color:var(--warn);background:none;border:0;font-weight:600;cursor:pointer;font-size:13px;padding:8px;width:100%;margin-top:8px}
 .ov{position:fixed;inset:0;background:rgba(36,31,23,.5);backdrop-filter:blur(3px);display:flex;align-items:flex-end;justify-content:center;z-index:50}
-.sheet{background:var(--paper);width:100%;max-width:680px;max-height:90vh;overflow:auto;border-radius:20px 20px 0 0;border:1px solid var(--line);animation:up .25s cubic-bezier(.2,.7,.3,1)}
+.sheet{background:var(--paper);width:100%;max-width:680px;max-height:90dvh;overflow:auto;border-radius:20px 20px 0 0;border:1px solid var(--line);animation:up .25s cubic-bezier(.2,.7,.3,1)}
 @keyframes up{from{transform:translateY(40px);opacity:.6}to{transform:none;opacity:1}}
 .shead{display:flex;align-items:center;gap:10px;padding:18px 18px 12px;position:sticky;top:0;background:var(--paper);border-bottom:1px solid var(--line);z-index:1}
 .shead h2{font-family:"Fraunces";font-weight:600;font-size:18px;flex:1}

@@ -67,12 +67,19 @@ export default function HujjajApp() {
 
   useEffect(() => {
     loadAll();
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const bump = () => {
+      if (t) clearTimeout(t);
+      t = setTimeout(loadAll, 250);
+    };
     const ch = supabase
       .channel("hujjaj")
-      .on("postgres_changes", { event: "*", schema: "public", table: "pilgrims" }, loadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "templates" }, loadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "pilgrims" }, bump)
+      .on("postgres_changes", { event: "*", schema: "public", table: "templates" }, bump)
+      .on("postgres_changes", { event: "*", schema: "public", table: "app_config" }, bump)
       .subscribe();
     return () => {
+      if (t) clearTimeout(t);
       supabase.removeChannel(ch);
     };
   }, [loadAll]);
@@ -99,24 +106,33 @@ export default function HujjajApp() {
   }
 
   async function commitParsed() {
-    const add = parsed.filter((r) => r.sel && r.phone.trim());
-    if (!add.length) return flash("Nothing selected");
-    const rows = add.map((r) => ({
-      name: r.name.trim(),
-      phone: r.phone.trim(),
-      notes: r.extra || "",
-      bus: "",
-      hotel: "",
-      room: "",
-      grp: "",
-    }));
+    const selected = parsed.filter((r) => r.sel && r.phone.trim());
+    if (!selected.length) return flash("Nothing selected");
+    const have = new Set(pilgrims.map((p) => normPhone(p.phone, cc)));
+    const seen = new Set<string>();
+    const rows: Omit<Pilgrim, "id">[] = [];
+    for (const r of selected) {
+      const n = normPhone(r.phone, cc);
+      if (!n || have.has(n) || seen.has(n)) continue;
+      seen.add(n);
+      rows.push({
+        name: r.name.trim(),
+        phone: r.phone.trim(),
+        notes: r.extra || "",
+        bus: "",
+        hotel: "",
+        room: "",
+        grp: "",
+      });
+    }
+    if (!rows.length) return flash("All already exist");
     const { error } = await supabase.from("pilgrims").insert(rows);
     if (error) return flash("Import failed");
     setParsed([]);
     setBulk("");
     setSheet(null);
-    flash(add.length + " hujjaj added");
-    loadAll();
+    const dupes = selected.length - rows.length;
+    flash(rows.length + " added" + (dupes ? ` · ${dupes} duplicates skipped` : ""));
   }
 
   async function addOne() {
@@ -134,7 +150,6 @@ export default function HujjajApp() {
     setOne({ name: "", phone: "", bus: "", grp: "" });
     setSheet(null);
     flash("Added");
-    loadAll();
   }
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -202,10 +217,9 @@ export default function HujjajApp() {
     await supabase.from("templates").update({ [field]: value }).eq("id", id);
   }
   async function tplAdd() {
-    const { error } = await supabase
+    await supabase
       .from("templates")
       .insert({ title: "New template", body: "Assalam o Alaikum {name}, ", sort: templates.length });
-    if (!error) loadAll();
   }
   async function tplDel(id: string) {
     await supabase.from("templates").delete().eq("id", id);
@@ -259,7 +273,6 @@ export default function HujjajApp() {
           }));
         if (rows.length) await supabase.from("pilgrims").insert(rows);
         flash(rows.length + " new hujjaj imported");
-        loadAll();
       } else flash("Not a valid backup file");
     } catch {
       flash("Could not read that file");
@@ -395,12 +408,20 @@ export default function HujjajApp() {
                       Message on WhatsApp
                     </button>
                     <div className="acts">
-                      <a className="btn g sm" href={"tel:+" + intl}>
-                        Call
-                      </a>
+                      {intl ? (
+                        <a className="btn g sm" href={"tel:+" + intl}>
+                          Call
+                        </a>
+                      ) : (
+                        <button className="btn g sm" onClick={() => flash("No valid number")}>
+                          Call
+                        </button>
+                      )}
                       <button
                         className="btn g sm"
-                        onClick={() => intl && window.open("https://wa.me/" + intl, "_blank")}
+                        onClick={() =>
+                          intl ? window.open("https://wa.me/" + intl, "_blank") : flash("No valid number")
+                        }
                       >
                         Open chat
                       </button>
