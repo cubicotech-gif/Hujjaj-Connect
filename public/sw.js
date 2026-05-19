@@ -1,8 +1,8 @@
 // Minimal app-shell cache. Network-first so data is always fresh.
-const C = "hujjaj-v1";
+const C = "hujjaj-v2";
 self.addEventListener("install", (e) => {
   self.skipWaiting();
-  e.waitUntil(caches.open(C).then((c) => c.addAll(["/", "/login"])));
+  e.waitUntil(caches.open(C).then((c) => c.addAll(["/"])));
 });
 self.addEventListener("activate", (e) => {
   e.waitUntil(
