@@ -16,7 +16,7 @@ export default function HujjajApp() {
   const [q, setQ] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
-  const [sheet, setSheet] = useState<null | "add" | "set" | "wa" | "bulk">(null);
+  const [sheet, setSheet] = useState<null | "add" | "set" | "wa" | "bulk" | "bulkedit">(null);
   const [waTarget, setWaTarget] = useState<Pilgrim | null>(null);
   const [tab, setTab] = useState<"paste" | "file" | "one">("paste");
   const [bulk, setBulk] = useState("");
@@ -29,6 +29,14 @@ export default function HujjajApp() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkQueue, setBulkQueue] = useState<{ p: Pilgrim; msg: string }[]>([]);
   const [bulkIdx, setBulkIdx] = useState(0);
+  const [bulkEdit, setBulkEdit] = useState({
+    hotel: "",
+    room: "",
+    bus: "",
+    grp: "",
+    checkin_at: "",
+    checkout_at: "",
+  });
   const toastT = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const flash = useCallback((m: string) => {
@@ -78,9 +86,12 @@ export default function HujjajApp() {
     );
   }, [pilgrims, q]);
 
+  const isDateField = (f: keyof Pilgrim) => f === "checkin_at" || f === "checkout_at";
+
   async function patch(id: string, field: keyof Pilgrim, value: string) {
-    setPilgrims((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
-    await supabase.from("pilgrims").update({ [field]: value }).eq("id", id);
+    const dbValue = isDateField(field) ? (value || null) : value;
+    setPilgrims((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: dbValue } : p)));
+    await supabase.from("pilgrims").update({ [field]: dbValue }).eq("id", id);
   }
   async function del(p: Pilgrim) {
     if (!confirm("Delete " + (p.name || "this person") + "?")) return;
@@ -88,6 +99,47 @@ export default function HujjajApp() {
     setPilgrims((cur) => cur.filter((x) => x.id !== p.id));
     flash("Deleted");
   }
+
+  async function bulkDelete() {
+    const ids = [...selected];
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} hujji? This cannot be undone.`)) return;
+    setPilgrims((cur) => cur.filter((p) => !selected.has(p.id)));
+    const { error } = await supabase.from("pilgrims").delete().in("id", ids);
+    if (error) return flash("Delete failed");
+    setSelected(new Set());
+    setSelectMode(false);
+    flash(`Deleted ${ids.length}`);
+  }
+
+  async function applyBulkEdit() {
+    const ids = [...selected];
+    if (!ids.length) return flash("Pick people first");
+    const updates: Record<string, string | null> = {};
+    (Object.keys(bulkEdit) as (keyof typeof bulkEdit)[]).forEach((k) => {
+      const v = bulkEdit[k].trim();
+      if (!v) return;
+      if (k === "checkin_at" || k === "checkout_at") updates[k] = v;
+      else updates[k] = v;
+    });
+    if (!Object.keys(updates).length) return flash("Fill at least one field");
+    setPilgrims((cur) => cur.map((p) => (selected.has(p.id) ? { ...p, ...updates } : p)));
+    const { error } = await supabase.from("pilgrims").update(updates).in("id", ids);
+    if (error) return flash("Update failed");
+    setBulkEdit({ hotel: "", room: "", bus: "", grp: "", checkin_at: "", checkout_at: "" });
+    setSheet(null);
+    setSelected(new Set());
+    setSelectMode(false);
+    flash(`Updated ${ids.length}`);
+  }
+
+  function fmtDate(s?: string | null): string {
+    if (!s) return "";
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  }
+  const today = () => new Date().toISOString().slice(0, 10);
 
   async function commitParsed() {
     const picked = parsed.filter((r) => r.sel && r.phone.trim());
@@ -258,9 +310,9 @@ export default function HujjajApp() {
     flash("Backup downloaded");
   }
   function expCsv() {
-    const head = ["name", "phone", "intl", "bus", "hotel", "room", "group", "notes"];
+    const head = ["name", "phone", "intl", "bus", "hotel", "room", "group", "notes", "checkin", "checkout"];
     const rows = pilgrims.map((p) =>
-      [p.name, p.phone, "+" + normPhone(p.phone, cc), p.bus, p.hotel, p.room, p.grp, p.notes]
+      [p.name, p.phone, "+" + normPhone(p.phone, cc), p.bus, p.hotel, p.room, p.grp, p.notes, p.checkin_at || "", p.checkout_at || ""]
         .map((v) => '"' + String(v || "").replace(/"/g, '""') + '"')
         .join(",")
     );
@@ -284,6 +336,8 @@ export default function HujjajApp() {
             room: p.room || "",
             grp: p.grp || "",
             notes: p.notes || "",
+            checkin_at: p.checkin_at || null,
+            checkout_at: p.checkout_at || null,
           }));
         if (rows.length) await supabase.from("pilgrims").insert(rows);
         flash(rows.length + " new hujjaj imported");
@@ -371,7 +425,14 @@ export default function HujjajApp() {
             const intl = normPhone(p.phone, cc);
             const ini = (p.name || "?").trim().charAt(0).toUpperCase() || "?";
             const meta =
-              [p.bus && "Bus " + p.bus, p.hotel, p.room && "Rm " + p.room, p.grp]
+              [
+                p.bus && "Bus " + p.bus,
+                p.hotel,
+                p.room && "Rm " + p.room,
+                p.grp,
+                p.checkin_at && "✓ In " + fmtDate(p.checkin_at),
+                p.checkout_at && "Out " + fmtDate(p.checkout_at),
+              ]
                 .filter(Boolean)
                 .join(" · ") || p.phone || "no details";
             const open = openId === p.id;
@@ -447,6 +508,44 @@ export default function HujjajApp() {
                           onBlur={(e) => e.target.value !== p.notes && patch(p.id, "notes", e.target.value)}
                         />
                       </div>
+                      <div className="fld">
+                        <label>Check-in</label>
+                        <input
+                          type="date"
+                          key={"in-" + p.id + "-" + (p.checkin_at || "")}
+                          defaultValue={p.checkin_at || ""}
+                          onBlur={(e) =>
+                            (e.target.value || null) !== (p.checkin_at || null) &&
+                            patch(p.id, "checkin_at", e.target.value)
+                          }
+                        />
+                        <button
+                          className="btn g sm"
+                          style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                          onClick={() => patch(p.id, "checkin_at", today())}
+                        >
+                          Check in today
+                        </button>
+                      </div>
+                      <div className="fld">
+                        <label>Check-out</label>
+                        <input
+                          type="date"
+                          key={"out-" + p.id + "-" + (p.checkout_at || "")}
+                          defaultValue={p.checkout_at || ""}
+                          onBlur={(e) =>
+                            (e.target.value || null) !== (p.checkout_at || null) &&
+                            patch(p.id, "checkout_at", e.target.value)
+                          }
+                        />
+                        <button
+                          className="btn g sm"
+                          style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                          onClick={() => patch(p.id, "checkout_at", today())}
+                        >
+                          Check out today
+                        </button>
+                      </div>
                     </div>
                     <button
                       className="btn wa"
@@ -498,10 +597,10 @@ export default function HujjajApp() {
               setSelected(same ? new Set() : ids);
             }}
           >
-            {selected.size === list.length && list.length > 0 ? "Clear" : "Select all"}
+            {selected.size === list.length && list.length > 0 ? "Clear" : "All"}
           </button>
           <div className="selcount">
-            <b>{selected.size}</b> selected
+            <b>{selected.size}</b>
           </div>
           <button
             className="btn p sm"
@@ -511,7 +610,26 @@ export default function HujjajApp() {
               setSheet("bulk");
             }}
           >
-            Send →
+            Send
+          </button>
+          <button
+            className="btn g sm"
+            disabled={selected.size === 0}
+            onClick={() => {
+              if (selected.size === 0) return flash("Pick at least one");
+              setBulkEdit({ hotel: "", room: "", bus: "", grp: "", checkin_at: "", checkout_at: "" });
+              setSheet("bulkedit");
+            }}
+          >
+            Edit
+          </button>
+          <button
+            className="btn sm"
+            style={{ background: "#fdecec", color: "var(--warn)", border: "1px solid #f3cfcf" }}
+            disabled={selected.size === 0}
+            onClick={bulkDelete}
+          >
+            Delete
           </button>
         </div>
       ) : (
@@ -847,6 +965,89 @@ export default function HujjajApp() {
                   </div>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK EDIT SHEET */}
+      {sheet === "bulkedit" && (
+        <div className="ov" onClick={(e) => e.target === e.currentTarget && setSheet(null)}>
+          <div className="sheet">
+            <div className="shead">
+              <h2>Edit {selected.size}</h2>
+              <button className="x" onClick={() => setSheet(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="sbody">
+              <div className="hint" style={{ marginTop: 0 }}>
+                Fill any field to apply to all selected. <b>Blank fields are left alone.</b>
+              </div>
+              <div className="grid">
+                <div className="fld">
+                  <label>Hotel</label>
+                  <input
+                    value={bulkEdit.hotel}
+                    placeholder="e.g. Swissotel Makkah"
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, hotel: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Room</label>
+                  <input
+                    value={bulkEdit.room}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, room: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Bus</label>
+                  <input
+                    value={bulkEdit.bus}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, bus: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Group</label>
+                  <input
+                    value={bulkEdit.grp}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, grp: e.target.value })}
+                  />
+                </div>
+                <div className="fld">
+                  <label>Check-in</label>
+                  <input
+                    type="date"
+                    value={bulkEdit.checkin_at}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, checkin_at: e.target.value })}
+                  />
+                  <button
+                    className="btn g sm"
+                    style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                    onClick={() => setBulkEdit({ ...bulkEdit, checkin_at: today() })}
+                  >
+                    Today
+                  </button>
+                </div>
+                <div className="fld">
+                  <label>Check-out</label>
+                  <input
+                    type="date"
+                    value={bulkEdit.checkout_at}
+                    onChange={(e) => setBulkEdit({ ...bulkEdit, checkout_at: e.target.value })}
+                  />
+                  <button
+                    className="btn g sm"
+                    style={{ width: "100%", marginTop: 6, fontSize: 12 }}
+                    onClick={() => setBulkEdit({ ...bulkEdit, checkout_at: today() })}
+                  >
+                    Today
+                  </button>
+                </div>
+              </div>
+              <button className="btn p" style={{ width: "100%", marginTop: 14 }} onClick={applyBulkEdit}>
+                Apply to {selected.size}
+              </button>
             </div>
           </div>
         </div>

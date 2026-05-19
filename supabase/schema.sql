@@ -15,9 +15,14 @@ create table if not exists pilgrims (
   room        text default '',
   grp         text default '',
   notes       text default '',
+  checkin_at  date,
+  checkout_at date,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
+-- Additive migrations (safe to re-run)
+alter table pilgrims add column if not exists checkin_at  date;
+alter table pilgrims add column if not exists checkout_at date;
 create index if not exists pilgrims_name_idx  on pilgrims using gin (to_tsvector('simple', coalesce(name,'')));
 create index if not exists pilgrims_phone_idx on pilgrims (phone);
 

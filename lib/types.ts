@@ -7,6 +7,8 @@ export type Pilgrim = {
   room: string;
   grp: string;
   notes: string;
+  checkin_at?: string | null;
+  checkout_at?: string | null;
   created_at?: string;
   updated_at?: string;
 };
